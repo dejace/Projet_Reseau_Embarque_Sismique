@@ -1,0 +1,17 @@
+../Core/Src/main.c:90:13:log_enqueue	2
+../Core/Src/main.c:111:5:main	1
+../Core/Src/main.c:204:6:SystemClock_Config	3
+../Core/Src/main.c:253:13:MX_ADC1_Init	5
+../Core/Src/main.c:318:13:MX_RTC_Init	4
+../Core/Src/main.c:377:13:MX_TIM2_Init	4
+../Core/Src/main.c:419:13:MX_USART3_UART_Init	2
+../Core/Src/main.c:449:13:MX_DMA_Init	1
+../Core/Src/main.c:467:13:MX_GPIO_Init	1
+../Core/Src/main.c:532:6:HAL_ADC_ConvCpltCallback	4
+../Core/Src/main.c:551:6:StartDefaultTask	1
+../Core/Src/main.c:571:6:LogMessageTask	3
+../Core/Src/main.c:595:6:StartClientTask	4
+../Core/Src/main.c:646:6:StartServerTask	3
+../Core/Src/main.c:686:6:StartHeartBeatTask	1
+../Core/Src/main.c:705:6:HAL_TIM_PeriodElapsedCallback	2
+../Core/Src/main.c:721:6:Error_Handler	1
