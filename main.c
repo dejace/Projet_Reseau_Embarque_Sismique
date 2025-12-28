@@ -12,14 +12,12 @@
 #include <stdarg.h>
 #include <math.h>
 
-
 #include "lwip/udp.h"
 #include "lwip/ip_addr.h"
 #include "lwip/netif.h"
 #include "lwip/timeouts.h"   // sys_now()
 #include "lwip/api.h"     // netconn_*
 #include "lwip/sys.h"
-
 
 /* USER CODE END Includes */
 
@@ -34,8 +32,6 @@
 #define WINDOW_SIZE        SAMPLE_RATE_HZ   // 1 seconde
 #define TCP_PORT_DATA      5000
 #define TCP_RX_TIMEOUT_MS  2000
-/* USER CODE END PD */
-
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -60,7 +56,12 @@ osThreadId heartBeatTaskHandle;
 osMessageQId messageQueueHandle;
 osMutexId uartMutexHandle;
 /* USER CODE BEGIN PV */
+static float mag_buffer[WINDOW_SIZE];
+static uint16_t mag_index = 0;
+static uint8_t mag_filled = 0;
 
+static float rms_1s = 0.0f;
+static float mean_1s = 0.0f;
 // ====== ADC DMA acquisition ======
 static uint16_t adc_dma_buf[3];          // 3 axes (X,Y,Z)
 static volatile uint32_t sample_counter = 0;
@@ -75,18 +76,10 @@ static volatile uint8_t net_ready = 0;
 static struct udp_pcb *presence_pcb = NULL;
 
 // ====== ID nœud ======
-static const char *NODE_ID = "nucleo-11";
+static const char *NODE_ID = "nucleo-01";
 osThreadId tcpServerTaskHandle;
 osThreadId tcpClientTaskHandle;
 /* USER CODE END PV */
-
-
-static float mag_buffer[WINDOW_SIZE];
-static uint16_t mag_index = 0;
-static uint8_t mag_filled = 0;
-
-static float rms_1s = 0.0f;
-static float mean_1s = 0.0f;
 
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
@@ -103,172 +96,162 @@ void StartServerTask(void const * argument);
 void StartHeartBeatTask(void const * argument);
 
 /* USER CODE BEGIN PFP */
-void StartTcpServerTask(void const * argument);
-void StartTcpClientTask(void const * argument);
+void StartTcpServerTask(void const *argument);
+void StartTcpClientTask(void const *argument);
+
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
 
-static void log_enqueue(const char *fmt, ...)
-{
-  // Alloue un message (pointeur envoyé dans la queue)
-  char *msg = (char*)pvPortMalloc(160);
-  if (!msg) return;
 
-  va_list args;
-  va_start(args, fmt);
-  vsnprintf(msg, 160, fmt, args);
-  va_end(args);
+static void log_enqueue(const char *fmt, ...) {
+	// Alloue un message (pointeur envoyé dans la queue)
+	char *msg = (char*) pvPortMalloc(160);
+	if (!msg)
+		return;
 
-  // On push le pointeur dans la queue CMSIS (uint32_t)
-  osMessagePut(messageQueueHandle, (uint32_t)msg, 0);
+	va_list args;
+	va_start(args, fmt);
+	vsnprintf(msg, 160, fmt, args);
+	va_end(args);
+
+	// On push le pointeur dans la queue CMSIS (uint32_t)
+	osMessagePut(messageQueueHandle, (uint32_t) msg, 0);
 }
-static void process_seismic(uint16_t x, uint16_t y, uint16_t z)
-{
-	float fx = (float)x;
-	float fy = (float)y;
-	float fz = (float)z;
-	float mag = sqrtf(fx*fx + fy*fy + fz*fz);
+static void process_seismic(uint16_t x, uint16_t y, uint16_t z) {
+	float fx = (float) x;
+	float fy = (float) y;
+	float fz = (float) z;
+	float mag = sqrtf(fx * fx + fy * fy + fz * fz);
 
-    mag_buffer[mag_index++] = mag;
+	mag_buffer[mag_index++] = mag;
 
-    if (mag_index >= WINDOW_SIZE)
-    {
-        mag_index = 0;
-        mag_filled = 1;
-    }
+	if (mag_index >= WINDOW_SIZE) {
+		mag_index = 0;
+		mag_filled = 1;
+	}
 
-    if (!mag_filled) return;
+	if (!mag_filled)
+		return;
 
-    float sum = 0.0f;
-    float sum_sq = 0.0f;
+	float sum = 0.0f;
+	float sum_sq = 0.0f;
 
-    for (int i = 0; i < WINDOW_SIZE; i++)
-    {
-        sum += mag_buffer[i];
-        sum_sq += mag_buffer[i] * mag_buffer[i];
-    }
+	for (int i = 0; i < WINDOW_SIZE; i++) {
+		sum += mag_buffer[i];
+		sum_sq += mag_buffer[i] * mag_buffer[i];
+	}
 
-    mean_1s = sum / WINDOW_SIZE;
-    rms_1s = sqrtf(sum_sq / WINDOW_SIZE);
+	mean_1s = sum / WINDOW_SIZE;
+	rms_1s = sqrtf(sum_sq / WINDOW_SIZE);
 }
-static void tcp_server_thread(void)
-{
-  struct netconn *conn = netconn_new(NETCONN_TCP);
-  if (!conn) {
-    log_enqueue("[TCP] netconn_new failed\r\n");
-    return;
-  }
+static void tcp_server_thread(void) {
+	struct netconn *conn = netconn_new(NETCONN_TCP);
+	if (!conn) {
+		log_enqueue("[TCP] netconn_new failed\r\n");
+		return;
+	}
 
-  if (netconn_bind(conn, IP_ADDR_ANY, TCP_PORT_DATA) != ERR_OK) {
-    log_enqueue("[TCP] bind failed\r\n");
-    netconn_delete(conn);
-    return;
-  }
+	if (netconn_bind(conn, IP_ADDR_ANY, TCP_PORT_DATA) != ERR_OK) {
+		log_enqueue("[TCP] bind failed\r\n");
+		netconn_delete(conn);
+		return;
+	}
 
-  netconn_listen(conn);
-  log_enqueue("[TCP] Listening on %d\r\n", TCP_PORT_DATA);
+	netconn_listen(conn);
+	log_enqueue("[TCP] Listening on %d\r\n", TCP_PORT_DATA);
 
-  while (1)
-  {
-    struct netconn *newconn;
-    err_t err = netconn_accept(conn, &newconn);
-    if (err == ERR_OK && newconn)
-    {
-      netconn_set_recvtimeout(newconn, TCP_RX_TIMEOUT_MS);
-      struct netbuf *buf;
-      void *data;
-      u16_t len;
+	while (1) {
+		struct netconn *newconn;
+		err_t err = netconn_accept(conn, &newconn);
+		if (err == ERR_OK && newconn) {
+			netconn_set_recvtimeout(newconn, TCP_RX_TIMEOUT_MS);
+			struct netbuf *buf;
+			void *data;
+			u16_t len;
 
-      // attend une requête (ex: "GET\n")
-      err = netconn_recv(newconn, &buf);
-      if (err == ERR_OK && buf)
-      {
-    	  netbuf_data(buf, &data, &len);
+			// attend une requête (ex: "GET\n")
+			err = netconn_recv(newconn, &buf);
+			if (err == ERR_OK && buf) {
+				netbuf_data(buf, &data, &len);
 
-    	  // Si le client envoie "GET"
-    	  if (len >= 3 && memcmp(data, "GET", 3) == 0)
-    	  {
-    	    uint16_t ax = adc_dma_buf[0];
-    	    uint16_t ay = adc_dma_buf[1];
-    	    uint16_t az = adc_dma_buf[2];
+				// Si le client envoie "GET"
+				if (len >= 3 && memcmp(data, "GET", 3) == 0) {
+					uint16_t ax = adc_dma_buf[0];
+					uint16_t ay = adc_dma_buf[1];
+					uint16_t az = adc_dma_buf[2];
 
-    	    char tx[256];
-    	    snprintf(tx, sizeof(tx),
-    	      "{ \"type\":\"data\", \"id\":\"%s\", \"x\":%u, \"y\":%u, \"z\":%u, \"mean_1s\":%.2f, \"rms_1s\":%.2f, \"t_ms\":%lu }\n",
-    	      NODE_ID, ax, ay, az, mean_1s, rms_1s, (unsigned long)sys_now());
+					char tx[256];
+					snprintf(tx, sizeof(tx),
+							"{ \"type\":\"data\", \"id\":\"%s\", \"x\":%u, \"y\":%u, \"z\":%u, \"mean_1s\":%.2f, \"rms_1s\":%.2f, \"t_ms\":%lu }\n",
+							NODE_ID, ax, ay, az, mean_1s, rms_1s,
+							(unsigned long) sys_now());
 
-    	    netconn_write(newconn, tx, strlen(tx), NETCONN_COPY);
-    	  }
-    	  else
-    	  {
-    	    const char *bad = "ERR\n";
-    	    netconn_write(newconn, bad, strlen(bad), NETCONN_COPY);
-    	  }
+					netconn_write(newconn, tx, strlen(tx), NETCONN_COPY);
+				} else {
+					const char *bad = "ERR\n";
+					netconn_write(newconn, bad, strlen(bad), NETCONN_COPY);
+				}
 
+				netbuf_delete(buf);
+			}
 
-        netbuf_delete(buf);
-      }
+			netconn_close(newconn);
+			netconn_delete(newconn);
+		}
 
-      netconn_close(newconn);
-      netconn_delete(newconn);
-    }
-
-    osDelay(5);
-  }
+		osDelay(5);
+	}
 }
-void StartTcpServerTask(void const * argument)
-{
-  while (!net_ready) osDelay(50);
-  tcp_server_thread();
+void StartTcpServerTask(void const *argument) {
+	while (!net_ready)
+		osDelay(50);
+	tcp_server_thread();
 }
-static void tcp_request_to(ip_addr_t *ip)
-{
-  struct netconn *c = netconn_new(NETCONN_TCP);
-  if (!c) return;
+static void tcp_request_to(ip_addr_t *ip) {
+	struct netconn *c = netconn_new(NETCONN_TCP);
+	if (!c)
+		return;
 
-  if (netconn_connect(c, ip, TCP_PORT_DATA) == ERR_OK)
-  {
-	netconn_set_recvtimeout(c, TCP_RX_TIMEOUT_MS);
-    const char *req = "GET\n";
-    netconn_write(c, req, strlen(req), NETCONN_COPY);
+	if (netconn_connect(c, ip, TCP_PORT_DATA) == ERR_OK) {
+		netconn_set_recvtimeout(c, TCP_RX_TIMEOUT_MS);
+		const char *req = "GET\n";
+		netconn_write(c, req, strlen(req), NETCONN_COPY);
 
-    struct netbuf *buf;
-    err_t err = netconn_recv(c, &buf);
-    if (err == ERR_OK && buf)
-    {
-      void *data;
-      u16_t len;
-      netbuf_data(buf, &data, &len);
+		struct netbuf *buf;
+		err_t err = netconn_recv(c, &buf);
+		if (err == ERR_OK && buf) {
+			void *data;
+			u16_t len;
+			netbuf_data(buf, &data, &len);
 
-      char rx[300];
-      u16_t cpy = (len < sizeof(rx)-1) ? len : (sizeof(rx)-1);
-      memcpy(rx, data, cpy);
-      rx[cpy] = 0;
+			char rx[300];
+			u16_t cpy = (len < sizeof(rx) - 1) ? len : (sizeof(rx) - 1);
+			memcpy(rx, data, cpy);
+			rx[cpy] = 0;
 
-      log_enqueue("[TCP-CLIENT] RX=%s\r\n", rx);
-      netbuf_delete(buf);
-    }
-  }
+			log_enqueue("[TCP-CLIENT] RX=%s\r\n", rx);
+			netbuf_delete(buf);
+		}
+	}
 
-  netconn_close(c);
-  netconn_delete(c);
+	netconn_close(c);
+	netconn_delete(c);
 }
 
-void StartTcpClientTask(void const * argument)
-{
-  while (!net_ready) osDelay(50);
+void StartTcpClientTask(void const *argument) {
+	while (!net_ready)
+		osDelay(50);
 
-  // Exemple: IP fixe d’un autre noeud (à adapter)
-  ip_addr_t target;
-  ip4addr_aton("192.168.1.191", ip_2_ip4(&target));
+	// Exemple: IP fixe d’un autre noeud (à adapter)
+	ip_addr_t target;
+	ip4addr_aton("192.168.1.191", ip_2_ip4(&target));
 
-  for (;;)
-  {
-    tcp_request_to(&target);
-    osDelay(2000); // toutes les 2s
-  }
+	for (;;) {
+		tcp_request_to(&target);
+		osDelay(2000); // toutes les 2s
+	}
 }
 
 /* USER CODE END 0 */
@@ -351,11 +334,13 @@ int main(void)
   heartBeatTaskHandle = osThreadCreate(osThread(heartBeatTask), NULL);
 
   /* USER CODE BEGIN RTOS_THREADS */
-  osThreadDef(tcpServerTask, StartTcpServerTask, osPriorityBelowNormal, 0, 512);
-  tcpServerTaskHandle = osThreadCreate(osThread(tcpServerTask), NULL);
+	osThreadDef(tcpServerTask, StartTcpServerTask, osPriorityBelowNormal, 0,
+			512);
+	tcpServerTaskHandle = osThreadCreate(osThread(tcpServerTask), NULL);
 
-  osThreadDef(tcpClientTask, StartTcpClientTask, osPriorityBelowNormal, 0, 512);
-  tcpClientTaskHandle = osThreadCreate(osThread(tcpClientTask), NULL);
+	osThreadDef(tcpClientTask, StartTcpClientTask, osPriorityBelowNormal, 0,
+			512);
+	tcpClientTaskHandle = osThreadCreate(osThread(tcpClientTask), NULL);
   /* USER CODE END RTOS_THREADS */
 
   /* Start scheduler */
@@ -428,11 +413,13 @@ static void MX_ADC1_Init(void)
 {
 
   /* USER CODE BEGIN ADC1_Init 0 */
+
   /* USER CODE END ADC1_Init 0 */
 
   ADC_ChannelConfTypeDef sConfig = {0};
 
   /* USER CODE BEGIN ADC1_Init 1 */
+
   /* USER CODE END ADC1_Init 1 */
 
   /** Configure the global features of the ADC (Clock, Resolution, Data Alignment and number of conversion)
@@ -480,6 +467,7 @@ static void MX_ADC1_Init(void)
     Error_Handler();
   }
   /* USER CODE BEGIN ADC1_Init 2 */
+
   /* USER CODE END ADC1_Init 2 */
 
 }
@@ -552,12 +540,14 @@ static void MX_TIM2_Init(void)
 {
 
   /* USER CODE BEGIN TIM2_Init 0 */
+
   /* USER CODE END TIM2_Init 0 */
 
   TIM_ClockConfigTypeDef sClockSourceConfig = {0};
   TIM_MasterConfigTypeDef sMasterConfig = {0};
 
   /* USER CODE BEGIN TIM2_Init 1 */
+
   /* USER CODE END TIM2_Init 1 */
   htim2.Instance = TIM2;
   htim2.Init.Prescaler = 2399;
@@ -581,6 +571,7 @@ static void MX_TIM2_Init(void)
     Error_Handler();
   }
   /* USER CODE BEGIN TIM2_Init 2 */
+
   /* USER CODE END TIM2_Init 2 */
 
 }
@@ -703,64 +694,59 @@ static void MX_GPIO_Init(void)
 }
 
 /* USER CODE BEGIN 4 */
-void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc)
-{
-  if (hadc->Instance == ADC1)
-  {
-    BaseType_t xHigherPriorityTaskWoken = pdFALSE;
-    sample_counter++;
+void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc) {
+	if (hadc->Instance == ADC1) {
+		BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+		sample_counter++;
 
-    if (acquisitionTaskHandle_freertos != NULL)
-    {
-      vTaskNotifyGiveFromISR(acquisitionTaskHandle_freertos, &xHigherPriorityTaskWoken);
-      portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
-    }
-  }
+		if (acquisitionTaskHandle_freertos != NULL) {
+			vTaskNotifyGiveFromISR(acquisitionTaskHandle_freertos,
+					&xHigherPriorityTaskWoken);
+			portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
+		}
+	}
 }
 
 /* USER CODE END 4 */
 
 /* USER CODE BEGIN Header_StartDefaultTask */
 /* USER CODE END Header_StartDefaultTask */
+/* USER CODE BEGIN 5 */
 void StartDefaultTask(void const * argument)
 {
-  /* init code for LWIP */
-	MX_LWIP_Init();
-	net_ready = 1;
-  /* USER CODE BEGIN 5 */
- // Log IP actuelle
-	extern struct netif gnetif;
-	log_enqueue("[MASTER] LwIP init OK. IP=%s\r\n", ip4addr_ntoa(netif_ip4_addr(&gnetif)));
+  MX_LWIP_Init();
 
-	// 2) Boucle maître (plus tard: bouton start/stop propre)
-	for (;;)
-	{
-	 osDelay(1000);
-   }
+  net_ready = 1;
+
+  for (;;)
+  {
+    osDelay(1000);
+  }
+
+
   /* USER CODE END 5 */
 }
+
 
 /* USER CODE BEGIN Header_LogMessageTask */
 /* USER CODE END Header_LogMessageTask */
 void LogMessageTask(void const * argument)
 {
   /* USER CODE BEGIN LogMessageTask */
-	for (;;)
-	  {
-	    osEvent evt = osMessageGet(messageQueueHandle, osWaitForever);
-	    if (evt.status == osEventMessage)
-	    {
-	      char *msg = (char*)evt.value.v;
-	      if (msg)
-	      {
-	        osMutexWait(uartMutexHandle, osWaitForever);
-	        HAL_UART_Transmit(&huart3, (uint8_t*)msg, (uint16_t)strlen(msg), 200);
-	        osMutexRelease(uartMutexHandle);
+	for (;;) {
+		osEvent evt = osMessageGet(messageQueueHandle, osWaitForever);
+		if (evt.status == osEventMessage) {
+			char *msg = (char*) evt.value.v;
+			if (msg) {
+				osMutexWait(uartMutexHandle, osWaitForever);
+				HAL_UART_Transmit(&huart3, (uint8_t*) msg,
+						(uint16_t) strlen(msg), 200);
+				osMutexRelease(uartMutexHandle);
 
-	        vPortFree(msg);
-	      }
-	    }
-	  }
+				vPortFree(msg);
+			}
+		}
+	}
   /* USER CODE END LogMessageTask */
 }
 
@@ -769,49 +755,54 @@ void LogMessageTask(void const * argument)
 void StartClientTask(void const * argument)
 {
   /* USER CODE BEGIN StartClientTask */
-	  // Attendre que le réseau soit prêt
-	  while (!net_ready) osDelay(50);
+	// Attendre que le réseau soit prêt
+	while (!net_ready)
+		osDelay(50);
 
-	  extern struct netif gnetif;
+	extern struct netif gnetif;
 
-	  presence_pcb = udp_new_ip_type(IPADDR_TYPE_V4);
-	  if (!presence_pcb)
-	  {
-	    log_enqueue("[PRESENCE] ERROR: udp_new\r\n");
-	    for(;;) osDelay(1000);
-	  }
+	presence_pcb = udp_new_ip_type(IPADDR_TYPE_V4);
+	if (!presence_pcb) {
+		log_enqueue("[PRESENCE] ERROR: udp_new failed\r\n");
+		for (;;)
+			osDelay(1000);
+	}
 
-	  // Autoriser broadcast
-	  ip_set_option(presence_pcb, SOF_BROADCAST);
+	// if (!presence_pcb)
+	//{
+	// log_enqueue("[PRESENCE] ERROR: udp_new\r\n");
+	//for(;;) osDelay(1000);
+	//}
 
-	  const uint16_t port = 12345;
+	// Autoriser broadcast
+	ip_set_option(presence_pcb, SOF_BROADCAST);
 
-	  for (;;)
-	  {
-	    // JSON minimal (timestamp = uptime ms)
-	    char payload[220];
-	    snprintf(payload, sizeof(payload),
-	             "{ \"type\":\"presence\", \"id\":\"%s\", \"ip\":\"%s\", \"timestamp_ms\":%lu }\r\n",
-	             NODE_ID,
-	             ip4addr_ntoa(netif_ip4_addr(&gnetif)),
-	             (unsigned long)sys_now());
+	const uint16_t port = 12345;
 
-	    struct pbuf *p = pbuf_alloc(PBUF_TRANSPORT, (uint16_t)strlen(payload), PBUF_RAM);
-	    if (p)
-	    {
-	      memcpy(p->payload, payload, strlen(payload));
+	for (;;) {
+		// JSON minimal (timestamp = uptime ms)
+		char payload[220];
+		snprintf(payload, sizeof(payload),
+				"{ \"type\":\"presence\", \"id\":\"%s\", \"ip\":\"%s\", \"timestamp_ms\":%lu }\r\n",
+				NODE_ID, ip4addr_ntoa(netif_ip4_addr(&gnetif)),
+				(unsigned long) sys_now());
 
-	      ip_addr_t bcast;
-	      ip4addr_aton("255.255.255.255", ip_2_ip4(&bcast));
+		struct pbuf *p = pbuf_alloc(PBUF_TRANSPORT, (uint16_t) strlen(payload),
+				PBUF_RAM);
+		if (p) {
+			memcpy(p->payload, payload, strlen(payload));
 
-	      udp_sendto(presence_pcb, p, &bcast, port);
-	      pbuf_free(p);
+			ip_addr_t bcast;
+			ip4addr_aton("255.255.255.255", ip_2_ip4(&bcast));
 
-	      log_enqueue("[PRESENCE] broadcast sent\r\n");
-	    }
+			udp_sendto(presence_pcb, p, &bcast, port);
+			pbuf_free(p);
 
-	    osDelay(10000); // 10s
-	  }
+			log_enqueue("[PRESENCE] broadcast sent\r\n");
+		}
+
+		osDelay(10000); // 10s
+	}
   /* USER CODE END StartClientTask */
 }
 
@@ -820,39 +811,35 @@ void StartClientTask(void const * argument)
 void StartServerTask(void const * argument)
 {
   /* USER CODE BEGIN StartServerTask */
-	  // On garde le handle FreeRTOS pour les notifications ISR
-	  acquisitionTaskHandle_freertos = xTaskGetCurrentTaskHandle();
+	// On garde le handle FreeRTOS pour les notifications ISR
+	acquisitionTaskHandle_freertos = xTaskGetCurrentTaskHandle();
 
-	  // Démarre TIM2 (TRGO) + ADC DMA
-	  HAL_TIM_Base_Start(&htim2);
+	// Démarre TIM2 (TRGO) + ADC DMA
+	HAL_TIM_Base_Start(&htim2);
 
-	  // Démarre ADC en DMA sur 3 valeurs
-	  if (HAL_ADC_Start_DMA(&hadc1, (uint32_t*)adc_dma_buf, 3) != HAL_OK)
+	// Démarre ADC en DMA sur 3 valeurs
+	if (HAL_ADC_Start_DMA(&hadc1, (uint32_t*) adc_dma_buf, 3) != HAL_OK) {
+		log_enqueue("[ADC] ERROR: HAL_ADC_Start_DMA\r\n");
+	} else {
+		log_enqueue("[ADC] DMA started (3ch) @100Hz via TIM2 TRGO\r\n");
+	}
+
+	for (;;)
+	{
+	  ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+
+	  uint16_t ax = adc_dma_buf[0];
+	  uint16_t ay = adc_dma_buf[1];
+	  uint16_t az = adc_dma_buf[2];
+
+	  process_seismic(ax, ay, az);
+
+	  if ((sample_counter % 100) == 0) // 1 Hz
 	  {
-	    log_enqueue("[ADC] ERROR: HAL_ADC_Start_DMA\r\n");
+	    log_enqueue("ADC: X=%u Y=%u Z=%u | mean=%.2f rms=%.2f | t=%lu\r\n",
+	                ax, ay, az, mean_1s, rms_1s, (unsigned long)sys_now());
 	  }
-	  else
-	  {
-	    log_enqueue("[ADC] DMA started (3ch) @100Hz via TIM2 TRGO\r\n");
-	  }
-
-	  for (;;)
-	  {
-	    // Attend une notif (1 échantillon complet)
-	    ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
-
-	    // Ici: tu as adc_dma_buf[0..2] mis à jour
-	    uint16_t ax = adc_dma_buf[0];
-	    uint16_t ay = adc_dma_buf[1];
-	    uint16_t az = adc_dma_buf[2];
-	    process_seismic(ax, ay, az);
-
-	    // Log léger (pas à 100Hz sinon tu floods l’UART)
-	    if ((sample_counter % 100) == 0) // 1 fois par seconde
-	    {
-	      log_enqueue("[ADC] 1s: X=%u Y=%u Z=%u\r\n", ax, ay, az);
-	    }
-	  }
+	}
   /* USER CODE END StartServerTask */
 }
 
@@ -861,11 +848,10 @@ void StartServerTask(void const * argument)
 void StartHeartBeatTask(void const * argument)
 {
   /* USER CODE BEGIN StartHeartBeatTask */
-	for (;;)
-	  {
-	    HAL_GPIO_TogglePin(LD1_GPIO_Port, LD1_Pin); // adapte si tu veux une autre LED
-	    osDelay(500);
-	  }
+	for (;;) {
+		HAL_GPIO_TogglePin(LD1_GPIO_Port, LD1_Pin); // adapte si tu veux une autre LED
+		osDelay(500);
+	}
   /* USER CODE END StartHeartBeatTask */
 }
 
