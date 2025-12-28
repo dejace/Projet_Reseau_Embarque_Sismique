@@ -11,13 +11,14 @@
 #include <string.h>
 #include <stdarg.h>
 #include <math.h>
-
+#include <stdlib.h>   // atof()
 #include "lwip/udp.h"
 #include "lwip/ip_addr.h"
 #include "lwip/netif.h"
 #include "lwip/timeouts.h"   // sys_now()
 #include "lwip/api.h"     // netconn_*
 #include "lwip/sys.h"
+
 
 /* USER CODE END Includes */
 
@@ -27,7 +28,14 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-/* USER CODE BEGIN PD */
+#define RMS_TOP_N              10
+#define MAX_NODES              8
+
+#define SEISM_RMS_THRESHOLD    1200.0f   // <-- à calibrer
+#define VALIDATION_WINDOW_MS   2500      // fenêtre de temps pour considérer les RMS "simultanées"
+#define REQUIRED_PEERS         1         // nb minimum de pairs au-dessus du seuil (en plus de toi)
+
+
 #define SAMPLE_RATE_HZ     100
 #define WINDOW_SIZE        SAMPLE_RATE_HZ   // 1 seconde
 #define TCP_PORT_DATA      5000
@@ -76,9 +84,31 @@ static volatile uint8_t net_ready = 0;
 static struct udp_pcb *presence_pcb = NULL;
 
 // ====== ID nœud ======
-static const char *NODE_ID = "nucleo-01";
+static const char *NODE_ID = "nucleo-11";
 osThreadId tcpServerTaskHandle;
 osThreadId tcpClientTaskHandle;
+typedef struct {
+    char id[16];               // ex: "nucleo-01"
+    ip_addr_t ip;
+    uint8_t used;
+
+    float top_rms[RMS_TOP_N];  // les 10 max RMS pour CE noeud
+    uint8_t top_count;
+
+    float last_rms;            // dernière RMS reçue
+    uint32_t last_ms;          // timestamp sys_now() associé
+} node_info_t;
+
+static node_info_t nodes[MAX_NODES];
+
+// Historique local (ton propre noeud)
+static float local_top_rms[RMS_TOP_N];
+static uint8_t local_top_count = 0;
+
+// Etat de détection locale
+static volatile uint8_t local_shake = 0;
+static volatile uint32_t local_shake_ms = 0;
+
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -98,6 +128,9 @@ void StartHeartBeatTask(void const * argument);
 /* USER CODE BEGIN PFP */
 void StartTcpServerTask(void const *argument);
 void StartTcpClientTask(void const *argument);
+static void top10_insert(float *arr, uint8_t *count, float v);
+static node_info_t* get_or_create_node(const char *id, const ip_addr_t *ip);
+static int parse_json_id_rms(const char *json, char *out_id, size_t out_id_sz, float *out_rms);
 
 /* USER CODE END PFP */
 
@@ -230,8 +263,21 @@ static void tcp_request_to(ip_addr_t *ip) {
 			u16_t cpy = (len < sizeof(rx) - 1) ? len : (sizeof(rx) - 1);
 			memcpy(rx, data, cpy);
 			rx[cpy] = 0;
+			char nid[16];
+			float rrms;
 
-			log_enqueue("[TCP-CLIENT] RX=%s\r\n", rx);
+			if (parse_json_id_rms(rx, nid, sizeof(nid), &rrms)) {
+			    node_info_t *n = get_or_create_node(nid, ip);
+			    if (n) {
+			        n->last_rms = rrms;
+			        n->last_ms  = sys_now();
+			        top10_insert(n->top_rms, &n->top_count, rrms);
+			    }
+
+			    log_enqueue("[TCP-CLIENT] %s rms=%.2f\r\n", nid, rrms);
+			} else {
+			    log_enqueue("[TCP-CLIENT] RX (unparsed)=%s\r\n", rx);
+			}
 			netbuf_delete(buf);
 		}
 	}
@@ -245,13 +291,85 @@ void StartTcpClientTask(void const *argument) {
 		osDelay(50);
 
 	// Exemple: IP fixe d’un autre noeud (à adapter)
-	ip_addr_t target;
-	ip4addr_aton("192.168.1.191", ip_2_ip4(&target));
+	static const char *peer_ips[] = {
+	    "192.168.10.100",
+	    // ajoute ici les autres cartes
+	};
+	static const int peer_count = sizeof(peer_ips)/sizeof(peer_ips[0]);
 
 	for (;;) {
-		tcp_request_to(&target);
-		osDelay(2000); // toutes les 2s
+	    for (int i = 0; i < peer_count; i++) {
+	        ip_addr_t target;
+	        ip4addr_aton(peer_ips[i], ip_2_ip4(&target));
+	        tcp_request_to(&target);
+	        osDelay(50);
+	    }
+	    osDelay(500);
 	}
+
+}
+static void top10_insert(float *arr, uint8_t *count, float v)
+{
+    // si pas assez de valeurs, on ajoute puis on trie
+    if (*count < RMS_TOP_N) {
+        arr[*count] = v;
+        (*count)++;
+    } else {
+        // si v <= plus petite (arr[RMS_TOP_N-1] après tri décroissant), on ignore
+        if (v <= arr[RMS_TOP_N - 1]) return;
+        arr[RMS_TOP_N - 1] = v;
+    }
+
+    // tri décroissant simple (RMS_TOP_N <= 10 donc c’est OK)
+    for (int i = 0; i < (int)(*count) - 1; i++) {
+        for (int j = i + 1; j < (int)(*count); j++) {
+            if (arr[j] > arr[i]) {
+                float tmp = arr[i];
+                arr[i] = arr[j];
+                arr[j] = tmp;
+            }
+        }
+    }
+}
+static node_info_t* get_or_create_node(const char *id, const ip_addr_t *ip)
+{
+    // Cherche existant
+    for (int i = 0; i < MAX_NODES; i++) {
+        if (nodes[i].used && strncmp(nodes[i].id, id, sizeof(nodes[i].id)) == 0) {
+            if (ip) nodes[i].ip = *ip;
+            return &nodes[i];
+        }
+    }
+    // Crée nouveau
+    for (int i = 0; i < MAX_NODES; i++) {
+        if (!nodes[i].used) {
+            memset(&nodes[i], 0, sizeof(nodes[i]));
+            nodes[i].used = 1;
+            strncpy(nodes[i].id, id, sizeof(nodes[i].id) - 1);
+            if (ip) nodes[i].ip = *ip;
+            return &nodes[i];
+        }
+    }
+    return NULL; // table pleine
+}
+static int parse_json_id_rms(const char *json, char *out_id, size_t out_id_sz, float *out_rms)
+{
+    const char *pid = strstr(json, "\"id\":\"");
+    const char *prms = strstr(json, "\"rms_1s\":");
+    if (!pid || !prms) return 0;
+
+    pid += strlen("\"id\":\"");
+    const char *pid_end = strchr(pid, '"');
+    if (!pid_end) return 0;
+
+    size_t n = (size_t)(pid_end - pid);
+    if (n >= out_id_sz) n = out_id_sz - 1;
+    memcpy(out_id, pid, n);
+    out_id[n] = 0;
+
+    prms += strlen("\"rms_1s\":");
+    *out_rms = (float)atof(prms);
+    return 1;
 }
 
 /* USER CODE END 0 */
@@ -833,6 +951,42 @@ void StartServerTask(void const * argument)
 	  uint16_t az = adc_dma_buf[2];
 
 	  process_seismic(ax, ay, az);
+	  top10_insert(local_top_rms, &local_top_count, rms_1s);
+	  // Détection locale
+	  if (rms_1s >= SEISM_RMS_THRESHOLD) {
+	      local_shake = 1;
+	      local_shake_ms = sys_now();
+
+	      // Validation: combien de pairs ont aussi dépassé le seuil dans la même fenêtre ?
+	      int peers_ok = 0;
+	      uint32_t now = sys_now();
+
+	      for (int i = 0; i < MAX_NODES; i++) {
+	          if (!nodes[i].used) continue;
+
+	          // RMS "récente" ?
+	          if ((now - nodes[i].last_ms) <= VALIDATION_WINDOW_MS) {
+	              if (nodes[i].last_rms >= SEISM_RMS_THRESHOLD) {
+	                  peers_ok++;
+	              }
+	          }
+	      }
+
+	      if (peers_ok >= REQUIRED_PEERS) {
+	          // => Secousse validée collectivement
+	          log_enqueue("[ALERT] Seisme valide ! local rms=%.2f peers_ok=%d\r\n", rms_1s, peers_ok);
+
+	          // Allume une LED d'alarme (choisis LD2 par ex, différente du heartbeat LD1)
+	          HAL_GPIO_WritePin(LD2_GPIO_Port, LD2_Pin, GPIO_PIN_SET);
+	      } else {
+	          // Pas validé
+	          HAL_GPIO_WritePin(LD2_GPIO_Port, LD2_Pin, GPIO_PIN_RESET);
+	      }
+	  } else {
+	      local_shake = 0;
+	      HAL_GPIO_WritePin(LD2_GPIO_Port, LD2_Pin, GPIO_PIN_RESET);
+	  }
+
 
 	  if ((sample_counter % 100) == 0) // 1 Hz
 	  {
